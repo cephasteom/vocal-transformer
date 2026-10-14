@@ -1,0 +1,24 @@
+[project]
+name = "vocal-transformer"
+version = "0.1.0"
+description = "Offline pitch/formant/time/auto-tune transformer for sung vocals"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "soundfile>=0.12",
+  "soxr>=0.3",
+  "pyworld>=0.3.4",
+  "setuptools<81",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore:pkg_resources is deprecated as an API:UserWarning",
+]
