@@ -64,6 +64,12 @@ uv run vocal_shift.py verse.wav preview.wav --autotune --key D --scale minor --p
 
 # Process every WAV in a folder the same way
 uv run vocal_shift.py takes/ takes_tuned/ --batch --autotune --key E --scale major
+
+# Classic robot/vocoder voice: flat carrier pitch, flattened formants, breathy noise
+uv run vocal_shift.py verse.wav verse_robot.wav --vocoder --vocoder-pitch A2 --vocoder-smooth 0.7 --vocoder-breath 0.3
+
+# Just flatten the formants a bit, keep the natural pitch contour
+uv run vocal_shift.py verse.wav verse_buzzy.wav --vocoder --vocoder-smooth 0.4
 ```
 
 Run `uv run vocal_shift.py --help` for the full option list.
@@ -85,6 +91,17 @@ Run `uv run vocal_shift.py --help` for the full option list.
   snappier/more obviously "autotuned", higher = smoother); `--vibrato-keep`
   reintroduces a fraction of the singer's original vibrato on top of the
   correction so sustained notes don't sound flat.
+- `--vocoder` plus `--vocoder-pitch`/`--vocoder-smooth`/`--vocoder-breath`:
+  a synthetic/robotic timbre effect, built from the same F0/envelope/
+  aperiodicity decomposition as everything else (see `apply_vocoder` in the
+  script). `--vocoder-pitch` replaces the natural pitch contour with a
+  constant carrier tone -- accepts either Hz (`110`) or a note name
+  (`A2`) -- and is optional (omit it to keep the natural pitch and just
+  apply smoothing/breath). `--vocoder-smooth` (0-1) blurs the formants
+  towards a flat, buzzy timbre. `--vocoder-breath` (0-1) blends the
+  aperiodicity towards fully noise-driven (breathy/whispered). All three
+  combine with pitch/formant shift and auto-tune if you want layered
+  effects.
 - `--analyze`: just print F0 range, voicing ratio etc. and exit -- useful
   for sanity-checking a take, or seeing how much correction a later
   `--autotune` run would need to do.

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -113,6 +114,32 @@ def hz_to_note_name(freq: float, a4: float = 440.0) -> str:
     octave = midi_round // 12 - 1
     name = NOTE_NAMES[midi_round % 12]
     return f"{name}{octave}"
+
+
+_NOTE_OCTAVE_RE = re.compile(r"^([A-Ga-g])([#b]?)(-?\d+)$")
+
+
+def note_name_to_hz(name: str, a4: float = 440.0) -> float:
+    """Parse a note+octave string (e.g. "A2", "C#4", "Bb3") to Hz, using
+    scientific pitch notation (C4 = MIDI 60)."""
+    m = _NOTE_OCTAVE_RE.match(name.strip())
+    if not m:
+        raise ValueError(f"unrecognised note {name!r}; expected e.g. A2, C#4, Bb3")
+    letter, accidental, octave = m.group(1).upper(), m.group(2), int(m.group(3))
+    pitch_class = parse_key(letter + accidental)
+    midi = (octave + 1) * 12 + pitch_class
+    return a4 * (2.0 ** ((midi - 69) / 12.0))
+
+
+def parse_pitch_or_note(value: str, a4: float = 440.0) -> float:
+    """Accept either a plain Hz value ("110") or a note name ("A2")."""
+    try:
+        hz = float(value)
+    except ValueError:
+        return note_name_to_hz(value, a4)
+    if hz <= 0:
+        raise ValueError(f"pitch must be positive Hz, got {value!r}")
+    return hz
 
 
 # ----------------------------------------------------------------------------
@@ -227,6 +254,18 @@ def shift_pitch(f0: np.ndarray, ratio: float) -> np.ndarray:
 FORMANT_RATIO_RANGE = (0.7, 1.4)
 
 
+def _normalise_envelope_energy(sp_orig: np.ndarray, sp_new: np.ndarray) -> np.ndarray:
+    """Rescale each frame of `sp_new` so its total energy matches `sp_orig`
+    (sp is squared-magnitude power), so reshaping the envelope doesn't by
+    itself cause an audible level jump."""
+    orig_energy = sp_orig.sum(axis=1)
+    new_energy = sp_new.sum(axis=1)
+    safe = new_energy > 1e-20
+    gain = np.ones(sp_orig.shape[0])
+    gain[safe] = orig_energy[safe] / new_energy[safe]
+    return sp_new * gain[:, np.newaxis]
+
+
 def shift_formant(
     sp: np.ndarray,
     alpha: float,
@@ -252,7 +291,7 @@ def shift_formant(
     if alpha == 1.0:
         return sp.copy()
 
-    n_frames, n_bins = sp.shape
+    n_bins = sp.shape[1]
     nyquist = fs / 2.0
     bin_hz = nyquist / (n_bins - 1)
 
@@ -282,15 +321,66 @@ def shift_formant(
     taper = np.maximum(taper, 1e-6)
     sp_new = sp_new * taper[np.newaxis, :]
 
-    # Preserve per-frame envelope energy (sp is squared-magnitude power).
-    orig_energy = sp.sum(axis=1)
-    new_energy = sp_new.sum(axis=1)
-    safe = new_energy > 1e-20
-    gain = np.ones(n_frames)
-    gain[safe] = orig_energy[safe] / new_energy[safe]
-    sp_new = sp_new * gain[:, np.newaxis]
+    return _normalise_envelope_energy(sp, sp_new)
 
-    return sp_new
+
+# ----------------------------------------------------------------------------
+# Vocoder (synthetic/robotic timbre)
+# ----------------------------------------------------------------------------
+
+VOCODER_SMOOTH_MAX_SIGMA_FRACTION = 0.12
+
+
+def smooth_envelope(sp: np.ndarray, amount: float) -> np.ndarray:
+    """Blur the spectral envelope along the frequency axis, in log domain,
+    reducing formant detail towards a flat/buzzy timbre. `amount` is 0
+    (unchanged) to 1 (heavily blurred). Per-frame energy is preserved.
+
+    Blurring happens in log (dB-like) domain rather than on the raw power
+    values so a few very loud bins (near a formant peak) don't dominate the
+    average and leave everything else untouched -- that would barely sound
+    different from the unblurred envelope.
+    """
+    if amount <= 0:
+        return sp.copy()
+    from scipy.ndimage import gaussian_filter1d
+
+    n_bins = sp.shape[1]
+    sigma = amount * VOCODER_SMOOTH_MAX_SIGMA_FRACTION * n_bins
+    if sigma <= 0:
+        return sp.copy()
+    log_sp = np.log(np.maximum(sp, 1e-12))
+    blurred = gaussian_filter1d(log_sp, sigma=sigma, axis=1, mode="nearest")
+    sp_new = np.exp(blurred)
+    return _normalise_envelope_energy(sp, sp_new)
+
+
+def add_breathiness(ap: np.ndarray, amount: float) -> np.ndarray:
+    """Blend aperiodicity towards 1.0 (fully noise-driven) by `amount`
+    (0 = untouched, 1 = fully breathy/whispered)."""
+    if amount <= 0:
+        return ap.copy()
+    return np.clip(ap + amount * (1.0 - ap), 0.0, 1.0)
+
+
+def apply_vocoder(
+    f0: np.ndarray,
+    sp: np.ndarray,
+    ap: np.ndarray,
+    pitch_hz: float | None,
+    smooth: float,
+    breath: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Classic vocoder effect built from the same F0/envelope/aperiodicity
+    decomposition as the rest of the pipeline: `pitch_hz` replaces the
+    natural pitch contour with a constant carrier tone (monotone/robotic),
+    `smooth` flattens the formants, and `breath` adds noise."""
+    f0_new = f0
+    if pitch_hz is not None:
+        f0_new = np.where(f0 > 0, pitch_hz, 0.0)
+    sp_new = smooth_envelope(sp, smooth)
+    ap_new = add_breathiness(ap, breath)
+    return f0_new, sp_new, ap_new
 
 
 # ----------------------------------------------------------------------------
@@ -683,6 +773,16 @@ def print_report(
         )
         print(f"Formant shift:   {formant_desc}")
         print(f"Time stretch:    {args.time_stretch:.3f}x")
+        if args.vocoder:
+            pitch_desc = (
+                f"{args.vocoder_pitch_hz:.2f} Hz carrier"
+                if args.vocoder_pitch_hz is not None
+                else "natural pitch contour"
+            )
+            print(
+                f"Vocoder:         {pitch_desc}, "
+                f"smooth {args.vocoder_smooth:.2f}, breath {args.vocoder_breath:.2f}"
+            )
 
     if autotune_stats is not None:
         print(
@@ -723,6 +823,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--vibrato-keep", type=float, default=0.0, help="Fraction of original vibrato kept, 0-1 (default: 0)")
     p.add_argument("--min-note-ms", type=float, default=80.0, help="Minimum note duration for segmentation (default: 80)")
 
+    p.add_argument("--vocoder", action="store_true", help="Enable synthetic/robotic vocoder effect")
+    p.add_argument("--vocoder-pitch", type=str, default=None, metavar="HZ|NOTE", help="Force a constant carrier pitch, e.g. 110 or A2 (requires --vocoder; omit to keep the natural pitch contour)")
+    p.add_argument("--vocoder-smooth", type=float, default=0.0, help="Spectral envelope smoothing, 0-1 (default: 0, requires --vocoder)")
+    p.add_argument("--vocoder-breath", type=float, default=0.0, help="Blend toward fully breathy/noisy, 0-1 (default: 0, requires --vocoder)")
+
     p.add_argument("--a4", type=float, default=440.0, help="Reference tuning in Hz (default: 440)")
     p.add_argument("--f0-min", type=float, default=60.0, help="Lowest expected F0 in Hz (default: 60)")
     p.add_argument("--f0-max", type=float, default=1100.0, help="Highest expected F0 in Hz (default: 1100)")
@@ -754,6 +859,27 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             parser.error(
                 f"the following options require --autotune to be set: {', '.join(used)}"
             )
+    if not args.vocoder:
+        vocoder_only = {
+            "--vocoder-pitch": args.vocoder_pitch,
+            "--vocoder-smooth": None if args.vocoder_smooth == 0.0 else args.vocoder_smooth,
+            "--vocoder-breath": None if args.vocoder_breath == 0.0 else args.vocoder_breath,
+        }
+        used = [name for name, val in vocoder_only.items() if val not in (None, False)]
+        if used:
+            parser.error(
+                f"the following options require --vocoder to be set: {', '.join(used)}"
+            )
+    if not 0.0 <= args.vocoder_smooth <= 1.0:
+        parser.error("--vocoder-smooth must be between 0 and 1")
+    if not 0.0 <= args.vocoder_breath <= 1.0:
+        parser.error("--vocoder-breath must be between 0 and 1")
+    args.vocoder_pitch_hz = None
+    if args.vocoder_pitch is not None:
+        try:
+            args.vocoder_pitch_hz = parse_pitch_or_note(args.vocoder_pitch, args.a4)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.f0_min >= args.f0_max:
         parser.error("--f0-min must be less than --f0-max")
     if not args.analyze and not args.batch and args.output is None:
@@ -815,6 +941,11 @@ def process_file(input_path: Path, output_path: Path | None, args: argparse.Name
         f0 = shift_pitch(f0, pitch_ratio)
         sp = shift_formant(frames.sp, formant_ratio, fs_working) if formant_ratio != 1.0 else frames.sp
         ap = frames.ap
+
+        if args.vocoder:
+            f0, sp, ap = apply_vocoder(
+                f0, sp, ap, args.vocoder_pitch_hz, args.vocoder_smooth, args.vocoder_breath
+            )
 
         if args.time_stretch != 1.0:
             f0, sp, ap = time_stretch_frames(f0, sp, ap, args.time_stretch)
